@@ -67,7 +67,7 @@ internal fun ReverseConnectHostEditor(
                 .padding(vertical = 8.dp)
                 .focusRequester(focusRequester),
             keyboardOptions = KeyboardOptions.Default.copy(
-                keyboardType = KeyboardType.Text,
+                keyboardType = KeyboardType.Uri,
                 autoCorrectEnabled = false,
                 imeAction = ImeAction.Done
             ),
