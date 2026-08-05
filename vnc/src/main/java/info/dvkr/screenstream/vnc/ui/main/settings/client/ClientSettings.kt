@@ -45,6 +45,9 @@ internal fun ReverseConnectHostEditor(
     reverseConnectHost: String,
     onValueChange: (String) -> Unit
 ) {
+    var currentReverseConnectHost by remember {
+        mutableStateOf(TextFieldValue(text = reverseConnectHost, selection = TextRange(reverseConnectHost.length)))
+    }
     val focusRequester = remember { FocusRequester() }
 
     SettingEditorLayout {
@@ -54,13 +57,20 @@ internal fun ReverseConnectHostEditor(
         )
 
         OutlinedTextField(
-            value = reverseConnectHost,
-            onValueChange = { host -> onValueChange(host) },
+            value = currentReverseConnectHost,
+            onValueChange = { host ->
+                currentReverseConnectHost = host.copy(selection = TextRange(host.text.length))
+                onValueChange(host.text)
+            },
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 8.dp)
                 .focusRequester(focusRequester),
-            keyboardOptions = KeyboardOptions.Default.copy(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
+            keyboardOptions = KeyboardOptions.Default.copy(
+                keyboardType = KeyboardType.Text,
+                autoCorrectEnabled = false,
+                imeAction = ImeAction.Done
+            ),
             singleLine = true,
         )
     }
