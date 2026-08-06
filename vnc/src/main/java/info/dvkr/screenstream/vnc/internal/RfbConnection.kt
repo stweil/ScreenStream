@@ -76,8 +76,14 @@ internal class RfbConnection(
 
     @Volatile
     private var clientPixelFormat = PixelFormat.DEFAULT
+    private var encoder = PixelEncoder(clientPixelFormat)
     private var zrleDeflater: Deflater? = null
     private var zlibDeflater: Deflater? = null
+    private var zrleBuffer: ByteArray? = null
+    private val deflateScratch = ByteArray(65536)
+    private val deflateOut = ByteArrayOutputStream(65536)
+    private val paletteMap = HashMap<Int, Int>(16)
+    private val paletteColors = IntArray(16)
 
     internal fun start() {
         runJob = scope.launch { run() }
@@ -178,6 +184,7 @@ internal class RfbConnection(
                     val format = ByteArray(16)
                     input.readFully(format)
                     clientPixelFormat = parsePixelFormat(format)
+                    encoder = PixelEncoder(clientPixelFormat)
                 }
 
                 0x02 -> { // SetEncodings
@@ -256,204 +263,154 @@ internal class RfbConnection(
         val useZRLE = compressionEnabled && ENCODING_ZRLE in encodings
         val useZlib = !useZRLE && compressionEnabled && ENCODING_ZLIB in encodings
 
+        val tile = ZRLE_TILE_SIZE
+        val rows = (height + tile - 1) / tile
+        val encoding = when {
+            useZRLE -> ENCODING_ZRLE
+            useZlib -> ENCODING_ZLIB
+            else -> ENCODING_RAW
+        }
+
         output.writeByte(0x00.toByte()) // FramebufferUpdate
         output.writeByte(0x00.toByte()) // Padding
-        output.writeShort(1.toShort())   // Number of rectangles
-        output.writeShort(0.toShort())   // X
-        output.writeShort(0.toShort())   // Y
-        output.writeShort(width.toShort())
-        output.writeShort(height.toShort())
-        when {
-            useZRLE -> {
-                output.writeInt(ENCODING_ZRLE)
-                val compressed = flushZRLE(buildZRLE(pixels, width, height))
-                output.writeInt(compressed.size)
-                output.writeFully(compressed)
-            }
+        output.writeShort(rows.toShort()) // Number of rectangles, one per tile row
 
-            useZlib -> {
-                output.writeInt(ENCODING_ZLIB)
-                val compressed = flushZlib(buildRaster(pixels, width, height))
-                output.writeInt(compressed.size)
-                output.writeFully(compressed)
+        val startNanos = System.nanoTime()
+        var totalBytes = 0
+        for (row in 0 until rows) {
+            val y = row * tile
+            val rectHeight = minOf(tile, height - y)
+            output.writeShort(0.toShort()) // X
+            output.writeShort(y.toShort()) // Y
+            output.writeShort(width.toShort())
+            output.writeShort(rectHeight.toShort())
+            output.writeInt(encoding)
+            val payload = when {
+                useZRLE -> flushZRLE(buildZRLEStrip(pixels, width, height, row))
+                useZlib -> flushZlib(buildRasterStrip(pixels, width, y, rectHeight))
+                else -> buildRasterStrip(pixels, width, y, rectHeight)
             }
-
-            else -> {
-                output.writeInt(ENCODING_RAW)
-                output.writeFully(buildRaster(pixels, width, height))
-            }
+            totalBytes += payload.size
+            output.writeInt(payload.size)
+            output.writeFully(payload)
         }
+        val encodeMillis = (System.nanoTime() - startNanos) / 1_000_000L
+        XLog.d(getLog("RfbConnection", "Frame ${width}x${height}: ${rows} rects, ${totalBytes} bytes in ${encodeMillis} ms"))
         output.flush()
     }
 
-    private fun buildZRLE(pixels: IntArray, width: Int, height: Int): ByteArray {
+    private fun buildZRLEStrip(pixels: IntArray, width: Int, height: Int, tileRow: Int): ByteArray {
         val tile = ZRLE_TILE_SIZE
-        val bytePerPixel = cpixelSize(clientPixelFormat)
-        val rows = (height + tile - 1) / tile
+        val bytePerPixel = encoder.cpixelBytes
         val cols = (width + tile - 1) / tile
-        val zrle = ByteArray(rows * cols * (1 + tile * tile * bytePerPixel))
+        val ty = tileRow * tile
+        val th = minOf(tile, height - ty)
+        val capacity = cols * (1 + tile * tile * bytePerPixel)
+        val zrle = zrleBuffer ?: ByteArray(capacity).also { zrleBuffer = it }
         var offset = 0
-        var ty = 0
-        while (ty < height) {
-            val th = minOf(tile, height - ty)
-            var tx = 0
-            while (tx < width) {
-                val tw = minOf(tile, width - tx)
-                zrle[offset++] = 0x00.toByte() // Subencoding: raw pixels
-                for (row in 0 until th) {
-                    var index = (ty + row) * width + tx
-                    for (col in 0 until tw) {
-                        offset = writePixelZRLE(pixels[index + col], clientPixelFormat, zrle, offset)
-                    }
-                }
-                tx += tile
-            }
-            ty += tile
+        var tx = 0
+        while (tx < width) {
+            val tw = minOf(tile, width - tx)
+            offset = buildTile(pixels, width, tx, ty, tw, th, zrle, offset)
+            tx += tile
         }
         return zrle.copyOf(offset)
     }
 
-    private fun cpixelSize(pf: PixelFormat): Int = when {
-        pf.bitsPerPixel <= 8 -> 1
-        pf.bitsPerPixel <= 16 -> 2
-        else -> {
-            val maxPixel = (pf.redMax shl pf.redShift) or (pf.greenMax shl pf.greenShift) or (pf.blueMax shl pf.blueShift)
-            val fitsLow = maxPixel < (1 shl 24)
-            val fitsHigh = (maxPixel and 0xFF) == 0
-            val lowCpixel = pf.depth <= 24 && ((fitsLow && !pf.bigEndian) || (fitsHigh && pf.bigEndian))
-            val highCpixel = pf.depth <= 24 && ((fitsLow && pf.bigEndian) || (fitsHigh && !pf.bigEndian))
-            if (lowCpixel || highCpixel) 3 else 4
-        }
-    }
-
-    // RFC 6143 CPIXEL: 32bpp formats with depth <= 24 use 3-byte pixels in ZRLE.
-    private fun writePixelZRLE(pixel: Int, pf: PixelFormat, out: ByteArray, offset: Int): Int {
-        val size = cpixelSize(pf)
-        if (size == 4) return writePixel(pixel, pf, out, offset)
-        val r = (pixel ushr 16) and 0xFF
-        val g = (pixel ushr 8) and 0xFF
-        val b = pixel and 0xFF
-        val rv = (r * pf.redMax) / 255
-        val gv = (g * pf.greenMax) / 255
-        val bv = (b * pf.blueMax) / 255
-        val value = (rv shl pf.redShift) or (gv shl pf.greenShift) or (bv shl pf.blueShift)
-        if (size == 1) {
-            out[offset] = value.toByte()
-            return offset + 1
-        }
-        if (size == 2) {
-            if (pf.bigEndian) {
-                out[offset] = ((value ushr 8) and 0xFF).toByte()
-                out[offset + 1] = (value and 0xFF).toByte()
-            } else {
-                out[offset] = (value and 0xFF).toByte()
-                out[offset + 1] = ((value ushr 8) and 0xFF).toByte()
+    // RFC 6143 subencodings 0 (raw), 1 (solid) and 2-16 (packed palette).
+    // Phone UIs are mostly flat colors, so solid/palette tiles shrink the
+    // payload dramatically compared to always-raw encoding.
+    private fun buildTile(pixels: IntArray, width: Int, tx: Int, ty: Int, tw: Int, th: Int, out: ByteArray, startOffset: Int): Int {
+        paletteMap.clear()
+        var unique = 0
+        var raw = false
+        rowLoop@ for (row in 0 until th) {
+            var index = (ty + row) * width + tx
+            for (col in 0 until tw) {
+                val pixel = pixels[index++]
+                if (!paletteMap.containsKey(pixel)) {
+                    if (unique >= 16) {
+                        raw = true
+                        break@rowLoop
+                    }
+                    paletteMap[pixel] = unique
+                    paletteColors[unique] = pixel
+                    unique++
+                }
             }
-            return offset + 2
         }
-        val maxPixel = (pf.redMax shl pf.redShift) or (pf.greenMax shl pf.greenShift) or (pf.blueMax shl pf.blueShift)
-        val fitsLow = maxPixel < (1 shl 24)
-        val fitsHigh = (maxPixel and 0xFF) == 0
-        val lowCpixel = pf.depth <= 24 && ((fitsLow && !pf.bigEndian) || (fitsHigh && pf.bigEndian))
-        val b0 = (value and 0xFF).toByte()
-        val b1 = ((value ushr 8) and 0xFF).toByte()
-        val b2 = ((value ushr 16) and 0xFF).toByte()
-        val b3 = ((value ushr 24) and 0xFF).toByte()
-        val native = if (pf.bigEndian) byteArrayOf(b3, b2, b1, b0) else byteArrayOf(b0, b1, b2, b3)
-        val index = if (lowCpixel) 0 else 1
-        out[offset] = native[index]
-        out[offset + 1] = native[index + 1]
-        out[offset + 2] = native[index + 2]
-        return offset + 3
+
+        var offset = startOffset
+        if (raw) {
+            out[offset++] = 0x00.toByte()
+            for (row in 0 until th) {
+                var index = (ty + row) * width + tx
+                for (col in 0 until tw) offset = encoder.writePixelZRLE(pixels[index++], out, offset)
+            }
+        } else if (unique == 1) {
+            out[offset++] = 0x01.toByte()
+            offset = encoder.writePixelZRLE(paletteColors[0], out, offset)
+        } else {
+            out[offset++] = unique.toByte()
+            for (i in 0 until unique) offset = encoder.writePixelZRLE(paletteColors[i], out, offset)
+            val bitsPerIndex = when (unique) {
+                2 -> 1
+                in 3..4 -> 2
+                else -> 4
+            }
+            for (row in 0 until th) {
+                var index = (ty + row) * width + tx
+                var byte = 0
+                var bitPos = 0
+                for (col in 0 until tw) {
+                    byte = (byte shl bitsPerIndex) or paletteMap.getValue(pixels[index++])
+                    bitPos += bitsPerIndex
+                    if (bitPos == 8) {
+                        out[offset++] = byte.toByte()
+                        byte = 0
+                        bitPos = 0
+                    }
+                }
+                if (bitPos > 0) out[offset++] = (byte shl (8 - bitPos)).toByte()
+            }
+        }
+        return offset
     }
 
     private fun flushZRLE(tileBytes: ByteArray): ByteArray {
         val deflater = zrleDeflater ?: Deflater(Deflater.DEFAULT_COMPRESSION).also { zrleDeflater = it }
-        val out = ByteArrayOutputStream(16384)
-        val buffer = ByteArray(65536)
-        deflater.setInput(tileBytes)
-        while (!deflater.needsInput()) {
-            val size = deflater.deflate(buffer, 0, buffer.size, Deflater.NO_FLUSH)
-            if (size == 0) break
-            out.write(buffer, 0, size)
-        }
-        while (true) {
-            val size = deflater.deflate(buffer, 0, buffer.size, Deflater.SYNC_FLUSH)
-            if (size == 0) break
-            out.write(buffer, 0, size)
-        }
-        return out.toByteArray()
+        return compress(deflater, tileBytes)
     }
 
     private fun flushZlib(raster: ByteArray): ByteArray {
         val deflater = zlibDeflater ?: Deflater(Deflater.DEFAULT_COMPRESSION).also { zlibDeflater = it }
-        val out = ByteArrayOutputStream(16384)
-        val buffer = ByteArray(65536)
-        deflater.setInput(raster)
+        return compress(deflater, raster)
+    }
+
+    private fun compress(deflater: Deflater, input: ByteArray): ByteArray {
+        deflateOut.reset()
+        deflater.setInput(input)
         while (!deflater.needsInput()) {
-            val size = deflater.deflate(buffer, 0, buffer.size, Deflater.NO_FLUSH)
+            val size = deflater.deflate(deflateScratch, 0, deflateScratch.size, Deflater.NO_FLUSH)
             if (size == 0) break
-            out.write(buffer, 0, size)
+            deflateOut.write(deflateScratch, 0, size)
         }
         while (true) {
-            val size = deflater.deflate(buffer, 0, buffer.size, Deflater.SYNC_FLUSH)
+            val size = deflater.deflate(deflateScratch, 0, deflateScratch.size, Deflater.SYNC_FLUSH)
             if (size == 0) break
-            out.write(buffer, 0, size)
+            deflateOut.write(deflateScratch, 0, size)
         }
-        return out.toByteArray()
+        return deflateOut.toByteArray()
     }
 
-    private fun buildRaster(pixels: IntArray, width: Int, height: Int): ByteArray {
-        val bytePerPixel = (clientPixelFormat.bitsPerPixel / 8).coerceIn(1, 4)
-        val raster = ByteArray(pixels.size * bytePerPixel)
+    private fun buildRasterStrip(pixels: IntArray, width: Int, y: Int, height: Int): ByteArray {
+        val bytePerPixel = encoder.rasterBpp
+        val raster = ByteArray(height * width * bytePerPixel)
         var offset = 0
-        for (pixel in pixels) offset = writePixel(pixel, clientPixelFormat, raster, offset)
+        var index = y * width
+        val end = index + height * width
+        while (index < end) offset = encoder.writePixel(pixels[index++], raster, offset)
         return raster
-    }
-
-    private fun writePixel(pixel: Int, pf: PixelFormat, out: ByteArray, offset: Int): Int {
-        val r = (pixel ushr 16) and 0xFF
-        val g = (pixel ushr 8) and 0xFF
-        val b = pixel and 0xFF
-        val rv = (r * pf.redMax) / 255
-        val gv = (g * pf.greenMax) / 255
-        val bv = (b * pf.blueMax) / 255
-        val value = (rv shl pf.redShift) or (gv shl pf.greenShift) or (bv shl pf.blueShift)
-        var o = offset
-        when ((pf.bitsPerPixel / 8).coerceIn(1, 4)) {
-            1 -> out[o++] = value.toByte()
-
-            2 -> if (pf.bigEndian) {
-                out[o++] = ((value ushr 8) and 0xFF).toByte()
-                out[o++] = (value and 0xFF).toByte()
-            } else {
-                out[o++] = (value and 0xFF).toByte()
-                out[o++] = ((value ushr 8) and 0xFF).toByte()
-            }
-
-            3 -> if (pf.bigEndian) {
-                out[o++] = ((value ushr 16) and 0xFF).toByte()
-                out[o++] = ((value ushr 8) and 0xFF).toByte()
-                out[o++] = (value and 0xFF).toByte()
-            } else {
-                out[o++] = (value and 0xFF).toByte()
-                out[o++] = ((value ushr 8) and 0xFF).toByte()
-                out[o++] = ((value ushr 16) and 0xFF).toByte()
-            }
-
-            else -> if (pf.bigEndian) {
-                out[o++] = ((value ushr 24) and 0xFF).toByte()
-                out[o++] = ((value ushr 16) and 0xFF).toByte()
-                out[o++] = ((value ushr 8) and 0xFF).toByte()
-                out[o++] = (value and 0xFF).toByte()
-            } else {
-                out[o++] = (value and 0xFF).toByte()
-                out[o++] = ((value ushr 8) and 0xFF).toByte()
-                out[o++] = ((value ushr 16) and 0xFF).toByte()
-                out[o++] = ((value ushr 24) and 0xFF).toByte()
-            }
-        }
-        return o
     }
 
     private fun parsePixelFormat(bytes: ByteArray): PixelFormat {
@@ -474,8 +431,91 @@ internal class RfbConnection(
         runCatching { socket.close() }
         zrleDeflater = null
         zlibDeflater = null
+        zrleBuffer = null
         scope.cancel()
         onClosed()
+    }
+}
+
+// RFC 6143 CPIXEL: 32bpp formats with depth <= 24 whose RGB bits fit in
+// 3 bytes use 3-byte pixels in ZRLE. All per-pixel transforms and byte
+// ordering are precomputed here so encoding 1080x2280 frames stays fast.
+private class PixelEncoder(pf: PixelFormat) {
+    val rasterBpp: Int = (pf.bitsPerPixel / 8).coerceIn(1, 4)
+    val cpixelBytes: Int = cpixelSize(pf)
+
+    private val identity =
+        pf.redMax == 255 && pf.greenMax == 255 && pf.blueMax == 255 &&
+            pf.redShift == 16 && pf.greenShift == 8 && pf.blueShift == 0
+
+    private val redLUT = buildLUT(pf.redMax, pf.redShift)
+    private val greenLUT = buildLUT(pf.greenMax, pf.greenShift)
+    private val blueLUT = buildLUT(pf.blueMax, pf.blueShift)
+
+    val rasterShifts: IntArray
+    val cpixelShifts: IntArray
+
+    init {
+        rasterShifts = when (rasterBpp) {
+            1 -> intArrayOf(0)
+            2 -> if (pf.bigEndian) intArrayOf(8, 0) else intArrayOf(0, 8)
+            3 -> if (pf.bigEndian) intArrayOf(16, 8, 0) else intArrayOf(0, 8, 16)
+            else -> if (pf.bigEndian) intArrayOf(24, 16, 8, 0) else intArrayOf(0, 8, 16, 24)
+        }
+        cpixelShifts = when (cpixelBytes) {
+            1 -> intArrayOf(0)
+            2 -> rasterShifts
+            3 -> if (pf.bigEndian) {
+                if (lowCpixel(pf)) intArrayOf(24, 16, 8) else intArrayOf(16, 8, 0)
+            } else {
+                if (lowCpixel(pf)) intArrayOf(0, 8, 16) else intArrayOf(8, 16, 24)
+            }
+            else -> rasterShifts
+        }
+    }
+
+    fun writePixel(pixel: Int, out: ByteArray, offset: Int): Int = writeBytes(pixel, rasterShifts, out, offset)
+
+    fun writePixelZRLE(pixel: Int, out: ByteArray, offset: Int): Int = writeBytes(pixel, cpixelShifts, out, offset)
+
+    private fun writeBytes(pixel: Int, shifts: IntArray, out: ByteArray, offset: Int): Int {
+        val value = if (identity) {
+            pixel and 0xFFFFFF
+        } else {
+            redLUT[(pixel ushr 16) and 0xFF] or greenLUT[(pixel ushr 8) and 0xFF] or blueLUT[pixel and 0xFF]
+        }
+        var o = offset
+        for (shift in shifts) out[o++] = ((value ushr shift) and 0xFF).toByte()
+        return o
+    }
+
+    companion object {
+        private fun cpixelSize(pf: PixelFormat): Int = when {
+            pf.bitsPerPixel <= 8 -> 1
+            pf.bitsPerPixel <= 16 -> 2
+            else -> if (pf.depth <= 24 && (lowCpixel(pf) || highCpixel(pf))) 3 else 4
+        }
+
+        private fun lowCpixel(pf: PixelFormat): Boolean {
+            val fitsLow = maxPixel(pf) < (1 shl 24)
+            val fitsHigh = (maxPixel(pf) and 0xFF) == 0
+            return (fitsLow && !pf.bigEndian) || (fitsHigh && pf.bigEndian)
+        }
+
+        private fun highCpixel(pf: PixelFormat): Boolean {
+            val fitsLow = maxPixel(pf) < (1 shl 24)
+            val fitsHigh = (maxPixel(pf) and 0xFF) == 0
+            return (fitsLow && pf.bigEndian) || (fitsHigh && !pf.bigEndian)
+        }
+
+        private fun maxPixel(pf: PixelFormat): Int =
+            (pf.redMax shl pf.redShift) or (pf.greenMax shl pf.greenShift) or (pf.blueMax shl pf.blueShift)
+
+        private fun buildLUT(maxValue: Int, shift: Int): IntArray {
+            val lut = IntArray(256)
+            for (i in 0 until 256) lut[i] = (i * maxValue / 255) shl shift
+            return lut
+        }
     }
 }
 
