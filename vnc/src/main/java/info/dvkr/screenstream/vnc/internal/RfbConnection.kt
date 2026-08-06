@@ -42,9 +42,11 @@ internal class RfbConnection(
         private const val RFB_VERSION = "RFB 003.008\n"
         private const val SERVER_NAME = "ScreenStream VNC"
         private const val ENCODING_RAW = 0
+        private const val ENCODING_ZLIB = 6
         private const val ENCODING_ZRLE = 16
         private const val ZRLE_TILE_SIZE = 64
         private const val MAX_CUT_TEXT_SKIP = 1 shl 20
+        private const val FIRST_BITMAP_TIMEOUT_MS = 3000L
 
         private val VERSION_REGEX = Regex("RFB\\s\\d{3}\\.\\d{3}")
 
@@ -69,7 +71,13 @@ internal class RfbConnection(
     @Volatile
     private var clientEncodings: Set<Int> = emptySet()
 
+    @Volatile
+    private var updateRequested = false
+
+    @Volatile
+    private var clientPixelFormat = PixelFormat.DEFAULT
     private var zrleDeflater: Deflater? = null
+    private var zlibDeflater: Deflater? = null
 
     internal fun start() {
         runJob = scope.launch { run() }
@@ -137,7 +145,7 @@ internal class RfbConnection(
     }
 
     private suspend fun serverInit(output: ByteWriteChannel): Pair<Int, Int> {
-        val bitmap = bitmapStateFlow.value
+        val bitmap = awaitRealBitmap()
         val width = bitmap.width.toShort()
         val height = bitmap.height.toShort()
 
@@ -152,12 +160,24 @@ internal class RfbConnection(
         return bitmap.width to bitmap.height
     }
 
+    private suspend fun awaitRealBitmap(): Bitmap {
+        val deadline = System.currentTimeMillis() + FIRST_BITMAP_TIMEOUT_MS
+        var bitmap = bitmapStateFlow.value
+        while (scope.isActive && bitmap.width <= 1 && bitmap.height <= 1 && System.currentTimeMillis() < deadline) {
+            delay(25)
+            bitmap = bitmapStateFlow.value
+        }
+        return bitmap
+    }
+
     private suspend fun clientLoop(input: ByteReadChannel) {
         while (scope.isActive) {
             when (val type = input.readByte().toInt() and 0xFF) {
-                0x00 -> { // SetPixelFormat (ignored)
+                0x00 -> { // SetPixelFormat
                     input.readFully(ByteArray(3))
-                    input.readFully(ByteArray(16))
+                    val format = ByteArray(16)
+                    input.readFully(format)
+                    clientPixelFormat = parsePixelFormat(format)
                 }
 
                 0x02 -> { // SetEncodings
@@ -168,12 +188,13 @@ internal class RfbConnection(
                     clientEncodings = encodings
                 }
 
-                0x03 -> { // FramebufferUpdateRequest (view-only: ignored)
+                0x03 -> { // FramebufferUpdateRequest
                     input.readByte()
                     input.readShort()
                     input.readShort()
                     input.readShort()
                     input.readShort()
+                    updateRequested = true
                 }
 
                 0x04 -> { // KeyEvent (ignored, view-only)
@@ -205,6 +226,14 @@ internal class RfbConnection(
     private suspend fun frameLoop(output: ByteWriteChannel, width: Int, height: Int) {
         var lastBitmap: Bitmap? = null
         while (scope.isActive) {
+            if (lastBitmap == null) {
+                // Wait for the client to negotiate encodings so the first frame uses the right encoding.
+                val deadline = System.currentTimeMillis() + FIRST_BITMAP_TIMEOUT_MS
+                while (scope.isActive && clientEncodings.isEmpty() && !updateRequested && System.currentTimeMillis() < deadline) {
+                    delay(10)
+                }
+                if (!scope.isActive) break
+            }
             val bitmap = bitmapStateFlow.value
             if (bitmap !== lastBitmap) {
                 lastBitmap = bitmap
@@ -222,8 +251,10 @@ internal class RfbConnection(
         val pixels = IntArray(width * height)
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
 
-        val useZRLE = zlibEnabled() && ENCODING_ZRLE in clientEncodings
-        val tileBytes = if (useZRLE) buildZRLE(pixels, width, height) else null
+        val encodings = clientEncodings
+        val compressionEnabled = zlibEnabled()
+        val useZRLE = compressionEnabled && ENCODING_ZRLE in encodings
+        val useZlib = !useZRLE && compressionEnabled && ENCODING_ZLIB in encodings
 
         output.writeByte(0x00.toByte()) // FramebufferUpdate
         output.writeByte(0x00.toByte()) // Padding
@@ -232,18 +263,24 @@ internal class RfbConnection(
         output.writeShort(0.toShort())   // Y
         output.writeShort(width.toShort())
         output.writeShort(height.toShort())
-        if (tileBytes != null) {
-            output.writeInt(ENCODING_ZRLE)
-            val compressed = flushZRLE(tileBytes)
-            output.writeInt(compressed.size)
-            output.writeFully(compressed)
-        } else {
-            output.writeInt(ENCODING_RAW)
-            for (pixel in pixels) {
-                output.writeByte((pixel and 0xFF).toByte())       // Blue
-                output.writeByte(((pixel ushr 8) and 0xFF).toByte()) // Green
-                output.writeByte(((pixel ushr 16) and 0xFF).toByte()) // Red
-                output.writeByte(0x00.toByte())
+        when {
+            useZRLE -> {
+                output.writeInt(ENCODING_ZRLE)
+                val compressed = flushZRLE(buildZRLE(pixels, width, height))
+                output.writeInt(compressed.size)
+                output.writeFully(compressed)
+            }
+
+            useZlib -> {
+                output.writeInt(ENCODING_ZLIB)
+                val compressed = flushZlib(buildRaster(pixels, width, height))
+                output.writeInt(compressed.size)
+                output.writeFully(compressed)
+            }
+
+            else -> {
+                output.writeInt(ENCODING_RAW)
+                output.writeFully(buildRaster(pixels, width, height))
             }
         }
         output.flush()
@@ -251,9 +288,10 @@ internal class RfbConnection(
 
     private fun buildZRLE(pixels: IntArray, width: Int, height: Int): ByteArray {
         val tile = ZRLE_TILE_SIZE
+        val bytePerPixel = (clientPixelFormat.bitsPerPixel / 8).coerceIn(1, 4)
         val rows = (height + tile - 1) / tile
         val cols = (width + tile - 1) / tile
-        val zrle = ByteArray(rows * cols * (1 + tile * tile * 3))
+        val zrle = ByteArray(rows * cols * (1 + tile * tile * bytePerPixel))
         var offset = 0
         var ty = 0
         while (ty < height) {
@@ -265,10 +303,7 @@ internal class RfbConnection(
                 for (row in 0 until th) {
                     var index = (ty + row) * width + tx
                     for (col in 0 until tw) {
-                        val pixel = pixels[index + col]
-                        zrle[offset++] = (pixel and 0xFF).toByte()       // Blue
-                        zrle[offset++] = ((pixel ushr 8) and 0xFF).toByte() // Green
-                        zrle[offset++] = ((pixel ushr 16) and 0xFF).toByte() // Red
+                        offset = writePixel(pixels[index + col], clientPixelFormat, zrle, offset)
                     }
                 }
                 tx += tile
@@ -296,11 +331,111 @@ internal class RfbConnection(
         return out.toByteArray()
     }
 
+    private fun flushZlib(raster: ByteArray): ByteArray {
+        val deflater = zlibDeflater ?: Deflater(Deflater.DEFAULT_COMPRESSION).also { zlibDeflater = it }
+        val out = ByteArrayOutputStream(16384)
+        val buffer = ByteArray(65536)
+        deflater.setInput(raster)
+        while (!deflater.needsInput()) {
+            val size = deflater.deflate(buffer, 0, buffer.size, Deflater.NO_FLUSH)
+            if (size == 0) break
+            out.write(buffer, 0, size)
+        }
+        while (true) {
+            val size = deflater.deflate(buffer, 0, buffer.size, Deflater.SYNC_FLUSH)
+            if (size == 0) break
+            out.write(buffer, 0, size)
+        }
+        return out.toByteArray()
+    }
+
+    private fun buildRaster(pixels: IntArray, width: Int, height: Int): ByteArray {
+        val bytePerPixel = (clientPixelFormat.bitsPerPixel / 8).coerceIn(1, 4)
+        val raster = ByteArray(pixels.size * bytePerPixel)
+        var offset = 0
+        for (pixel in pixels) offset = writePixel(pixel, clientPixelFormat, raster, offset)
+        return raster
+    }
+
+    private fun writePixel(pixel: Int, pf: PixelFormat, out: ByteArray, offset: Int): Int {
+        val r = (pixel ushr 16) and 0xFF
+        val g = (pixel ushr 8) and 0xFF
+        val b = pixel and 0xFF
+        val rv = (r * pf.redMax) / 255
+        val gv = (g * pf.greenMax) / 255
+        val bv = (b * pf.blueMax) / 255
+        val value = (rv shl pf.redShift) or (gv shl pf.greenShift) or (bv shl pf.blueShift)
+        var o = offset
+        when ((pf.bitsPerPixel / 8).coerceIn(1, 4)) {
+            1 -> out[o++] = value.toByte()
+
+            2 -> if (pf.bigEndian) {
+                out[o++] = ((value ushr 8) and 0xFF).toByte()
+                out[o++] = (value and 0xFF).toByte()
+            } else {
+                out[o++] = (value and 0xFF).toByte()
+                out[o++] = ((value ushr 8) and 0xFF).toByte()
+            }
+
+            3 -> if (pf.bigEndian) {
+                out[o++] = ((value ushr 16) and 0xFF).toByte()
+                out[o++] = ((value ushr 8) and 0xFF).toByte()
+                out[o++] = (value and 0xFF).toByte()
+            } else {
+                out[o++] = (value and 0xFF).toByte()
+                out[o++] = ((value ushr 8) and 0xFF).toByte()
+                out[o++] = ((value ushr 16) and 0xFF).toByte()
+            }
+
+            else -> if (pf.bigEndian) {
+                out[o++] = ((value ushr 24) and 0xFF).toByte()
+                out[o++] = ((value ushr 16) and 0xFF).toByte()
+                out[o++] = ((value ushr 8) and 0xFF).toByte()
+                out[o++] = (value and 0xFF).toByte()
+            } else {
+                out[o++] = (value and 0xFF).toByte()
+                out[o++] = ((value ushr 8) and 0xFF).toByte()
+                out[o++] = ((value ushr 16) and 0xFF).toByte()
+                out[o++] = ((value ushr 24) and 0xFF).toByte()
+            }
+        }
+        return o
+    }
+
+    private fun parsePixelFormat(bytes: ByteArray): PixelFormat {
+        val bitsPerPixel = bytes[0].toInt() and 0xFF
+        val bigEndian = (bytes[2].toInt() and 0xFF) != 0
+        val trueColour = (bytes[3].toInt() and 0xFF) != 0
+        val redMax = ((bytes[4].toInt() and 0xFF) shl 8) or (bytes[5].toInt() and 0xFF)
+        val greenMax = ((bytes[6].toInt() and 0xFF) shl 8) or (bytes[7].toInt() and 0xFF)
+        val blueMax = ((bytes[8].toInt() and 0xFF) shl 8) or (bytes[9].toInt() and 0xFF)
+        val redShift = bytes[10].toInt() and 0xFF
+        val greenShift = bytes[11].toInt() and 0xFF
+        val blueShift = bytes[12].toInt() and 0xFF
+        return PixelFormat(bitsPerPixel, bigEndian, trueColour, redMax, greenMax, blueMax, redShift, greenShift, blueShift)
+    }
+
     private fun close() {
         runCatching { socket.close() }
-        runCatching { zrleDeflater?.end() }
         zrleDeflater = null
+        zlibDeflater = null
         scope.cancel()
         onClosed()
+    }
+}
+
+private data class PixelFormat(
+    val bitsPerPixel: Int,
+    val bigEndian: Boolean,
+    val trueColour: Boolean,
+    val redMax: Int,
+    val greenMax: Int,
+    val blueMax: Int,
+    val redShift: Int,
+    val greenShift: Int,
+    val blueShift: Int
+) {
+    companion object {
+        val DEFAULT = PixelFormat(bitsPerPixel = 32, bigEndian = false, trueColour = true, redMax = 255, greenMax = 255, blueMax = 255, redShift = 16, greenShift = 8, blueShift = 0)
     }
 }
