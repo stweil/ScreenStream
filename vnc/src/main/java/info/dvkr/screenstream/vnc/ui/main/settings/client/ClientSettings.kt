@@ -59,8 +59,8 @@ internal fun ReverseConnectHostEditor(
         OutlinedTextField(
             value = currentReverseConnectHost,
             onValueChange = { host ->
-                currentReverseConnectHost = host.copy(selection = TextRange(host.text.length))
-                onValueChange(host.text)
+                currentReverseConnectHost = host
+                if (reverseConnectHost != host.text) onValueChange(host.text)
             },
             modifier = Modifier
                 .fillMaxWidth()
@@ -73,6 +73,15 @@ internal fun ReverseConnectHostEditor(
             ),
             singleLine = true,
         )
+    }
+
+    LaunchedEffect(reverseConnectHost) {
+        if (reverseConnectHost != currentReverseConnectHost.text) {
+            currentReverseConnectHost = TextFieldValue(
+                text = reverseConnectHost,
+                selection = TextRange(reverseConnectHost.length)
+            )
+        }
     }
 
     LaunchedEffect(focusRequester) { focusRequester.requestFocus() }
