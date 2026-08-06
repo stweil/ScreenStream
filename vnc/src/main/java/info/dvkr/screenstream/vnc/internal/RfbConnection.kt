@@ -288,7 +288,7 @@ internal class RfbConnection(
 
     private fun buildZRLE(pixels: IntArray, width: Int, height: Int): ByteArray {
         val tile = ZRLE_TILE_SIZE
-        val bytePerPixel = (clientPixelFormat.bitsPerPixel / 8).coerceIn(1, 4)
+        val bytePerPixel = cpixelSize(clientPixelFormat)
         val rows = (height + tile - 1) / tile
         val cols = (width + tile - 1) / tile
         val zrle = ByteArray(rows * cols * (1 + tile * tile * bytePerPixel))
@@ -303,7 +303,7 @@ internal class RfbConnection(
                 for (row in 0 until th) {
                     var index = (ty + row) * width + tx
                     for (col in 0 until tw) {
-                        offset = writePixel(pixels[index + col], clientPixelFormat, zrle, offset)
+                        offset = writePixelZRLE(pixels[index + col], clientPixelFormat, zrle, offset)
                     }
                 }
                 tx += tile
@@ -311,6 +311,60 @@ internal class RfbConnection(
             ty += tile
         }
         return zrle.copyOf(offset)
+    }
+
+    private fun cpixelSize(pf: PixelFormat): Int = when {
+        pf.bitsPerPixel <= 8 -> 1
+        pf.bitsPerPixel <= 16 -> 2
+        else -> {
+            val maxPixel = (pf.redMax shl pf.redShift) or (pf.greenMax shl pf.greenShift) or (pf.blueMax shl pf.blueShift)
+            val fitsLow = maxPixel < (1 shl 24)
+            val fitsHigh = (maxPixel and 0xFF) == 0
+            val lowCpixel = pf.depth <= 24 && ((fitsLow && !pf.bigEndian) || (fitsHigh && pf.bigEndian))
+            val highCpixel = pf.depth <= 24 && ((fitsLow && pf.bigEndian) || (fitsHigh && !pf.bigEndian))
+            if (lowCpixel || highCpixel) 3 else 4
+        }
+    }
+
+    // RFC 6143 CPIXEL: 32bpp formats with depth <= 24 use 3-byte pixels in ZRLE.
+    private fun writePixelZRLE(pixel: Int, pf: PixelFormat, out: ByteArray, offset: Int): Int {
+        val size = cpixelSize(pf)
+        if (size == 4) return writePixel(pixel, pf, out, offset)
+        val r = (pixel ushr 16) and 0xFF
+        val g = (pixel ushr 8) and 0xFF
+        val b = pixel and 0xFF
+        val rv = (r * pf.redMax) / 255
+        val gv = (g * pf.greenMax) / 255
+        val bv = (b * pf.blueMax) / 255
+        val value = (rv shl pf.redShift) or (gv shl pf.greenShift) or (bv shl pf.blueShift)
+        if (size == 1) {
+            out[offset] = value.toByte()
+            return offset + 1
+        }
+        if (size == 2) {
+            if (pf.bigEndian) {
+                out[offset] = ((value ushr 8) and 0xFF).toByte()
+                out[offset + 1] = (value and 0xFF).toByte()
+            } else {
+                out[offset] = (value and 0xFF).toByte()
+                out[offset + 1] = ((value ushr 8) and 0xFF).toByte()
+            }
+            return offset + 2
+        }
+        val maxPixel = (pf.redMax shl pf.redShift) or (pf.greenMax shl pf.greenShift) or (pf.blueMax shl pf.blueShift)
+        val fitsLow = maxPixel < (1 shl 24)
+        val fitsHigh = (maxPixel and 0xFF) == 0
+        val lowCpixel = pf.depth <= 24 && ((fitsLow && !pf.bigEndian) || (fitsHigh && pf.bigEndian))
+        val b0 = (value and 0xFF).toByte()
+        val b1 = ((value ushr 8) and 0xFF).toByte()
+        val b2 = ((value ushr 16) and 0xFF).toByte()
+        val b3 = ((value ushr 24) and 0xFF).toByte()
+        val native = if (pf.bigEndian) byteArrayOf(b3, b2, b1, b0) else byteArrayOf(b0, b1, b2, b3)
+        val index = if (lowCpixel) 0 else 1
+        out[offset] = native[index]
+        out[offset + 1] = native[index + 1]
+        out[offset + 2] = native[index + 2]
+        return offset + 3
     }
 
     private fun flushZRLE(tileBytes: ByteArray): ByteArray {
@@ -404,6 +458,7 @@ internal class RfbConnection(
 
     private fun parsePixelFormat(bytes: ByteArray): PixelFormat {
         val bitsPerPixel = bytes[0].toInt() and 0xFF
+        val depth = bytes[1].toInt() and 0xFF
         val bigEndian = (bytes[2].toInt() and 0xFF) != 0
         val trueColour = (bytes[3].toInt() and 0xFF) != 0
         val redMax = ((bytes[4].toInt() and 0xFF) shl 8) or (bytes[5].toInt() and 0xFF)
@@ -412,7 +467,7 @@ internal class RfbConnection(
         val redShift = bytes[10].toInt() and 0xFF
         val greenShift = bytes[11].toInt() and 0xFF
         val blueShift = bytes[12].toInt() and 0xFF
-        return PixelFormat(bitsPerPixel, bigEndian, trueColour, redMax, greenMax, blueMax, redShift, greenShift, blueShift)
+        return PixelFormat(bitsPerPixel, depth, bigEndian, trueColour, redMax, greenMax, blueMax, redShift, greenShift, blueShift)
     }
 
     private fun close() {
@@ -426,6 +481,7 @@ internal class RfbConnection(
 
 private data class PixelFormat(
     val bitsPerPixel: Int,
+    val depth: Int,
     val bigEndian: Boolean,
     val trueColour: Boolean,
     val redMax: Int,
@@ -436,6 +492,6 @@ private data class PixelFormat(
     val blueShift: Int
 ) {
     companion object {
-        val DEFAULT = PixelFormat(bitsPerPixel = 32, bigEndian = false, trueColour = true, redMax = 255, greenMax = 255, blueMax = 255, redShift = 16, greenShift = 8, blueShift = 0)
+        val DEFAULT = PixelFormat(bitsPerPixel = 32, depth = 24, bigEndian = false, trueColour = true, redMax = 255, greenMax = 255, blueMax = 255, redShift = 16, greenShift = 8, blueShift = 0)
     }
 }
